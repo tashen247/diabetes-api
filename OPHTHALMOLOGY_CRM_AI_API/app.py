@@ -2087,6 +2087,404 @@ async def predict_rvo(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS FOR HYPERTENSION & RVO SCREENING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_prob_keys(prob_map: Dict[str, float]) -> Dict[str, float]:
+    """Normalize probability keys to canonical forms using CANON mapping."""
+    if not prob_map:
+        return {}
+    return {CANON.get(k, k): float(v) for k, v in prob_map.items()}
+
+
+def safe_best(prob_map: Dict[str, float]) -> Dict[str, Any]:
+    """Safely extract best result from probabilities. Returns canonical label and ads_id."""
+    if not prob_map:
+        return {"label": "NoSuspectOrNegative", "ads_id": ADS["NoSuspectOrNegative"], "prob": 0.0}
+    canon = normalize_prob_keys(prob_map)
+    label = max(canon, key=canon.get)
+    return {"label": label, "ads_id": ADS.get(label, 7), "prob": canon[label], "engine": "probabilities"}
+
+
+def _bilateral_drae_promote(left_probs: Dict, right_probs: Dict, left_best: Dict, right_best: Dict) -> Dict:
+    """
+    Apply bilateral DRAE (Decreased Retinal Artery Elasticity) promotion logic.
+    Only upgrades NoSuspectOrNegative to DRAE if both eyes indicate DRAE.
+    """
+    changed = False
+    left_result = left_best.copy()
+    right_result = right_best.copy()
+    
+    # Check if both eyes have DRAE as a strong possibility
+    left_canon = normalize_prob_keys(left_probs)
+    right_canon = normalize_prob_keys(right_probs)
+    
+    left_drae_prob = left_canon.get("DecreasedRetinalArteryElasticity", 0.0)
+    right_drae_prob = right_canon.get("DecreasedRetinalArteryElasticity", 0.0)
+    
+    # If both eyes have DRAE with decent confidence and currently showing negative, upgrade
+    if (left_best.get("label") == "NoSuspectOrNegative" and left_drae_prob > 0.3 and
+        right_best.get("label") == "NoSuspectOrNegative" and right_drae_prob > 0.3):
+        left_result = {"label": "DecreasedRetinalArteryElasticity", "ads_id": ADS["DecreasedRetinalArteryElasticity"], "prob": left_drae_prob, "engine": "bilateral_drae"}
+        right_result = {"label": "DecreasedRetinalArteryElasticity", "ads_id": ADS["DecreasedRetinalArteryElasticity"], "prob": right_drae_prob, "engine": "bilateral_drae"}
+        changed = True
+    
+    return {
+        "left_best": left_result,
+        "right_best": right_result,
+        "changed": changed,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCREENER HELPER — reusable across any individual condition endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+SCREENER_URL = os.environ.get("SCREENER_URL", "http://ophthalmology-crm-ai-prod:8027/screen")
+
+
+async def _screen_single_condition(
+    condition:    str,
+    image_bytes:  bytes,
+    filename:     str,
+    content_type: str,
+    referral_id:  str,
+    existing_ads: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Call port 8027 /screen for one eye, extract the result for one condition.
+    Returns the condition block dict or None if screener unavailable.
+
+    Example return:
+    {
+        "grade":           "Suspect or Positive",
+        "ads_id":          25,
+        "confidence":      0.82,
+        "findings":        "Flame haemorrhages in superior quadrant...",
+        "override":        True,
+        "override_reason": "positive_finding: conf=0.82 >= 0.72",
+        "final": {"ads_id": 25, "prediction": "Suspect or Positive"}
+    }
+    """
+    try:
+        existing_payload = json.dumps({condition: existing_ads}) if existing_ads is not None else "{}"
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            resp = await client.post(
+                SCREENER_URL,
+                files={"file": (filename, image_bytes, content_type or "image/jpeg")},
+                data={
+                    "referral_id":      referral_id,
+                    "existing_ads_ids": existing_payload,
+                },
+            )
+            if resp.status_code != 200:
+                logging.warning(
+                    f"[screener/{condition}] Port 8027 returned {resp.status_code} "
+                    f"for {filename}"
+                )
+                return None
+
+            data      = resp.json()
+            cond_data = (data.get("conditions") or {}).get(condition)
+            if not cond_data:
+                logging.warning(f"[screener/{condition}] No '{condition}' key in response")
+                return None
+
+            return cond_data
+
+    except Exception as e:
+        logging.warning(f"[screener/{condition}] Unavailable: {e}")
+        return None
+
+
+def _apply_screener_override(
+    condition:    str,
+    eye:          str,
+    current_ads:  int,
+    scr_result:   Optional[Dict],
+) -> tuple:
+    """
+    Apply screener override logic for one eye.
+    Returns (final_ads_id, final_prediction, was_overridden, screener_findings).
+    """
+    if scr_result is None:
+        return current_ads, None, False, None
+
+    final      = scr_result.get("final", {})
+    final_ads  = final.get("ads_id", current_ads)
+    final_pred = final.get("prediction")
+    overridden = scr_result.get("override", False)
+    findings   = scr_result.get("llava", {}).get("findings", "")
+    confidence = scr_result.get("llava", {}).get("confidence", 0.0)
+
+    if overridden:
+        logging.info(
+            f"[screener/{condition}] {eye} eye OVERRIDDEN: "
+            f"ads_id {current_ads} → {final_ads} ({final_pred}) "
+            f"conf={confidence:.2f} | {findings[:80]}"
+        )
+    else:
+        logging.info(
+            f"[screener/{condition}] {eye} eye no override "
+            f"(conf={confidence:.2f}, reason={scr_result.get('override_reason')})"
+        )
+
+    return final_ads, final_pred, overridden, findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATED predict-rvo (v2)
+# ─────────────────────────────────────────────────────────────────────────────
+@condition_router.post("/predict-rvo-v2")
+async def predict_rvo_v2(
+        referral_id: str,
+        left_eye_file:  UploadFile = File(...),
+        right_eye_file: UploadFile = File(...),
+):
+    """
+    RVO prediction with screener support.
+    Port 8008 result is primary. Port 8027 screener overrides if confident.
+    """
+    condition = "rvo"
+    model_id  = 6
+    left_id, right_id = 131, 130
+
+    dbf.insert_endpoint_logs(
+        referral_id,
+        f"{base_url}/predict-{condition}?referral_id={referral_id}",
+        condition, left_id, right_id, 8
+    )
+
+    # Read files once
+    l_bytes = await left_eye_file.read()
+    r_bytes = await right_eye_file.read()
+    l_ct    = left_eye_file.content_type  or "image/jpeg"
+    r_ct    = right_eye_file.content_type or "image/jpeg"
+
+    # ── Port 8008 primary ─────────────────────────────────────────────────────
+    import io as _io
+    from fastapi import UploadFile as _UF
+    from starlette.datastructures import UploadFile as _SUF
+
+    async def _make_upload(data: bytes, fname: str, ct: str):
+        """Reconstruct an UploadFile from bytes for handler functions."""
+        from starlette.datastructures import UploadFile as SUF
+        import io
+        return SUF(file=io.BytesIO(data), filename=fname, headers={"content-type": ct})
+
+    left_upload  = await _make_upload(l_bytes, left_eye_file.filename,  l_ct)
+    right_upload = await _make_upload(r_bytes, right_eye_file.filename, r_ct)
+
+    left_result  = await handle_rvo(referral_id, left_upload)
+    right_result = await handle_rvo(referral_id, right_upload)
+
+    left_ads  = (left_result.get("rvo")  or {}).get("ads_id", 24)
+    right_ads = (right_result.get("rvo") or {}).get("ads_id", 24)
+
+    # ── Port 8027 screener ────────────────────────────────────────────────────
+    left_scr  = await _screen_single_condition(condition, l_bytes, left_eye_file.filename,  l_ct, referral_id, left_ads)
+    right_scr = await _screen_single_condition(condition, r_bytes, right_eye_file.filename, r_ct, referral_id, right_ads)
+
+    left_final_ads,  left_pred,  left_overridden,  left_findings  = _apply_screener_override(condition, "left",  left_ads,  left_scr)
+    right_final_ads, right_pred, right_overridden, right_findings = _apply_screener_override(condition, "right", right_ads, right_scr)
+
+    # ── DB writes ─────────────────────────────────────────────────────────────
+    dbf.write_results_to_db(
+        referral_id, ai_id=left_id,
+        ads_ad_id=get_ad_id(condition), ads_id=left_final_ads,
+        model_no=model_id,
+        confidence_scores=json.dumps({
+            left_pred or "rvo": (left_scr or {}).get("llava", {}).get("confidence", 1.0)
+        }),
+    )
+    dbf.write_results_to_db(
+        referral_id, ai_id=right_id,
+        ads_ad_id=get_ad_id(condition), ads_id=right_final_ads,
+        model_no=model_id,
+        confidence_scores=json.dumps({
+            right_pred or "rvo": (right_scr or {}).get("llava", {}).get("confidence", 1.0)
+        }),
+    )
+
+    dbf.insert_endpoint_logs(
+        referral_id,
+        f"{base_url}/predict-{condition}?referral_id={referral_id}",
+        condition, left_id, right_id, 8
+    )
+
+    return {
+        "referral_id": referral_id,
+        "diagnosis":   condition,
+        "left_eye_result": {
+            **left_result,
+            "screener": {
+                "override":  left_overridden,
+                "final_ads": left_final_ads,
+                "findings":  left_findings,
+            },
+            "final_ads_id": left_final_ads,
+        },
+        "right_eye_result": {
+            **right_result,
+            "screener": {
+                "override":  right_overridden,
+                "final_ads": right_final_ads,
+                "findings":  right_findings,
+            },
+            "final_ads_id": right_final_ads,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATED predict-hypertension (v2)
+# ─────────────────────────────────────────────────────────────────────────────
+@condition_router.post("/predict-hypertension-v2")
+async def predict_hypertension_v2(
+        referral_id:    str,
+        left_eye_file:  UploadFile = File(...),
+        right_eye_file: UploadFile = File(...),
+):
+    """
+    Hypertension prediction with screener support.
+    Port 8003 (pair endpoint) is primary. Port 8027 screener overrides if confident.
+    Screener can only upgrade — it will not downgrade an existing positive result.
+    """
+    try:
+        condition = "hypertension"
+        model_no  = 9
+        ads_ad_id = get_ad_id(condition)
+        left_id, right_id = 131, 130
+
+        # Read files once
+        l_bytes = await left_eye_file.read()
+        r_bytes = await right_eye_file.read()
+        l_ct    = left_eye_file.content_type  or "application/octet-stream"
+        r_ct    = right_eye_file.content_type or "application/octet-stream"
+
+        # ── Port 8003 primary (pair endpoint) ─────────────────────────────────
+        limits  = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        timeout = httpx.Timeout(connect=3.0, read=60.0, write=30.0, pool=3.0)
+
+        async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+            # Health check
+            try:
+                h = await client.get(HEALTHZ, timeout=3.0)
+                if h.status_code != 200:
+                    raise HTTPException(status_code=502, detail=f"HTN /healthz bad status {h.status_code}")
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"HTN /healthz error: {e}")
+
+            resp = await client.post(
+                PAIR_EP,
+                files={
+                    "left_eye_file":  (left_eye_file.filename  or "left.jpg",  l_bytes, l_ct),
+                    "right_eye_file": (right_eye_file.filename or "right.jpg", r_bytes, r_ct),
+                },
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            result = resp.json()
+
+        # Unpack port 8003 result (same logic as existing predict_hypertension)
+        left_node  = result.get("left",  {}) or {}
+        right_node = result.get("right", {}) or {}
+
+        left_probs_raw  = left_node.get("probabilities")  or left_node.get("probs")  or {}
+        right_probs_raw = right_node.get("probabilities") or right_node.get("probs") or {}
+
+        left_probs  = normalize_prob_keys(left_probs_raw)
+        right_probs = normalize_prob_keys(right_probs_raw)
+
+        left_best  = left_node.get("best_ads_overridden")  or safe_best(left_probs)
+        right_best = right_node.get("best_ads_overridden") or safe_best(right_probs)
+
+        # Bilateral DRAE promotion (existing logic)
+        bilat      = _bilateral_drae_promote(left_probs, right_probs, left_best, right_best)
+        left_best  = bilat["left_best"]
+        right_best = bilat["right_best"]
+
+        left_label,  left_ads  = left_best["label"],  int(left_best["ads_id"])
+        right_label, right_ads = right_best["label"], int(right_best["ads_id"])
+
+        # ── Port 8027 screener ────────────────────────────────────────────────
+        left_scr  = await _screen_single_condition(condition, l_bytes, left_eye_file.filename,  l_ct, referral_id, left_ads)
+        right_scr = await _screen_single_condition(condition, r_bytes, right_eye_file.filename, r_ct, referral_id, right_ads)
+
+        left_final_ads,  left_scr_pred,  left_overridden,  left_findings  = _apply_screener_override(condition, "left",  left_ads,  left_scr)
+        right_final_ads, right_scr_pred, right_overridden, right_findings = _apply_screener_override(condition, "right", right_ads, right_scr)
+
+        # Normalise label to canonical format (matching existing endpoint output)
+        # Port 8003 uses canonical keys e.g. "NoSuspectOrNegative"
+        # Screener returns human-readable e.g. "Hypertensive Retinopathy Grade 1 or 2"
+        # CANON map normalises both to canonical for .NET compatibility
+        def _to_canonical(label: str) -> str:
+            return CANON.get(label, label)
+
+        left_final_label  = _to_canonical(left_scr_pred  if left_overridden  else left_label)
+        right_final_label = _to_canonical(right_scr_pred if right_overridden else right_label)
+
+        # ── DB writes ─────────────────────────────────────────────────────────
+        dbf.write_results_to_db(
+            referral_id, ai_id=left_id,
+            ads_ad_id=ads_ad_id, ads_id=left_final_ads,
+            model_no=model_no,
+            confidence_scores=json.dumps(left_probs),
+        )
+        dbf.write_results_to_db(
+            referral_id, ai_id=right_id,
+            ads_ad_id=ads_ad_id, ads_id=right_final_ads,
+            model_no=model_no,
+            confidence_scores=json.dumps(right_probs),
+        )
+
+        dbf.insert_endpoint_logs(
+            referral_id,
+            f"{base_url}/predict-hypertension?referral_id={referral_id}",
+            condition, left_id, right_id, model_no,
+        )
+
+        pair = _pair_priority(left_final_label, right_final_label)
+
+        return {
+            "referral_id": referral_id,
+            "diagnosis":   condition,
+            "left_eye_result": {
+                "ads_id":     left_final_ads,
+                "label":      left_final_label,
+                "confidence": left_probs,
+                "screener": {
+                    "override":  left_overridden,
+                    "final_ads": left_final_ads,
+                    "findings":  left_findings,
+                },
+            },
+            "right_eye_result": {
+                "ads_id":     right_final_ads,
+                "label":      right_final_label,
+                "confidence": right_probs,
+                "screener": {
+                    "override":  right_overridden,
+                    "final_ads": right_final_ads,
+                    "findings":  right_findings,
+                },
+            },
+            "pair_summary": pair,
+            "bilateral": {
+                "changed":       bilat["changed"],
+                "left_engine":   left_best.get("engine"),
+                "right_engine":  right_best.get("engine"),
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[Hypertension v2] Failed referral {referral_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 from fastapi import HTTPException
 
 
