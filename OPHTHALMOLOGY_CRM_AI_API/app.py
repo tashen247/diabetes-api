@@ -2494,14 +2494,15 @@ CDR_SERVICE_URL = os.environ.get(
     "http://ophthalmology-crm-ai-prod:8019/cdr/analyze"
 )
 from typing import Optional, Literal, Dict, Any
-# --- endpoints (override in ENV if needed) ---
-MODEL_API = os.environ.get("GLAUCOMA_MODEL_URL", "http://ophthalmology-crm-ai-prod:8012/predict-glaucoma")
-CDR_API   = os.environ.get("CDR_ANALYZE_URL",     "http://ophthalmology-crm-ai-prod:8019/cdr/analyze")
+# ─────────────────────────────────────────────────────────────────────────────
+# GLAUCOMA SERVICE URLS
+# ─────────────────────────────────────────────────────────────────────────────
+SUPER_ANALYZE_URL = os.environ.get("SUPER_ANALYZE_URL",   "http://ophthalmology-crm-ai-prod:8025/super-analyze")
+MODEL_API         = os.environ.get("GLAUCOMA_MODEL_URL",  "http://ophthalmology-crm-ai-prod:8012/predict-glaucoma")
+# CDR_API kept for reference / other callers
+CDR_API           = os.environ.get("CDR_ANALYZE_URL",     "http://ophthalmology-crm-ai-prod:8019/cdr/analyze")
 
 # --- helpers ---------------------------------------------------------------
-
-FUSE_CDR_THRESH = 0.75   # upgrade threshold on CDR
-FUSE_CONF_MAX   = 0.60   # only upgrade if model max-prob < 0.60
 
 def _guess_eye_from_name(name: str) -> Literal["left", "right"]:
     """
@@ -2539,114 +2540,219 @@ async def _predict_one_eye_fused(
     db_image_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Calls :8012 model + :8019 CDR, applies fuse:
-      - Use model ads_id by default (17=Glaucoma, 16=Normal)
-      - If model says Normal (16) with confidence < 0.60 AND CDR >= 0.75 -> upgrade to 17
-    Returns merged dict + 'fuse' section.
+    Primary:  port 8025 /super-analyze (SegFormer CDR + LLaVA reasoning).
+    Fallback: port 8012 /predict-glaucoma (ResNet50 model probability only).
+
+    Fixes applied vs old version:
+      - model_ads derived from probabilities (not the unreliable ads_id field)
+      - CDR key reads cdr_value (not vertical_cdr which port 8019 never returned)
+      - CDR sanity clamp rejects values outside (0, 1]
+      - FUSE_CDR_THRESH lowered from 0.75 → 0.55
     """
-    # read once; reuse bytes for both posts
     data = await image_file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty image upload")
 
-    # 1) determine eye (respect explicit arg; fallback to guess; else 'auto')
     eye = eye_side or _guess_eye_from_name(image_file.filename or "") or "auto"
 
-    # 2) resolve G folder and filename to use for overlays
-    g_root = g_folder
-    db_name_from_db = None
-    if not g_root:
-        try:
-            # ensure referral_id is int for the DB helper
-            g_root, db_name_from_db = dbf._db_get_g_folder(int(referral_id))
-        except Exception:
-            # soft-fail; g_root stays None and service will fall back to local overlays
-            g_root, db_name_from_db = (g_root, None)
+    # ── Try port 8025 (SegFormer + LLaVA) first ──────────────────────────────
+    super_result = None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+            resp = await client.post(
+                SUPER_ANALYZE_URL,
+                files={"file": (
+                    image_file.filename,
+                    data,
+                    getattr(image_file, "content_type", None) or "image/jpeg"
+                )},
+                data={"referral_id": referral_id},
+            )
+            if resp.status_code == 200:
+                super_result = resp.json()
+                logging.info(
+                    f"[glaucoma] 8025 OK: real_cdr={super_result.get('real_cdr')}, "
+                    f"ads_id={super_result.get('ads_id')}, "
+                    f"basis={super_result.get('decision_basis')}"
+                )
+            else:
+                logging.warning(
+                    f"[glaucoma] 8025 returned {resp.status_code} — falling back to 8012"
+                )
+    except Exception as e:
+        logging.warning(f"[glaucoma] 8025 unreachable ({e}) — falling back to 8012")
 
-    save_name = db_image_name or db_name_from_db or (image_file.filename or "image.jpg")
+    # ── Build response from port 8025 result ──────────────────────────────────
+    if super_result:
+        final_ads  = int(super_result.get("ads_id", 16))
+        final_pred = super_result.get("prediction", "Normal")
+        real_cdr   = float(super_result.get("real_cdr", 0.0))
+        geo_cdr    = super_result.get("geometric_cdr")
+        vlm_cdr    = float(super_result.get("vlm_estimate", 0.0))
+        basis      = super_result.get("decision_basis", "CDR")
 
-    # ---------- call both services ----------
+        return {
+            "eye":          eye,
+            "filename":     image_file.filename,
+            "referral_id":  referral_id,
+            "source":       "port_8025_super_analyze",
+
+            "model": {
+                "glaucoma_probability": real_cdr,
+                "normal_probability":   round(1.0 - real_cdr, 4),
+                "prediction":           final_pred,
+                "ads_id":               final_ads,
+                "overlay_url":          None,
+                "cdr_analysis": {
+                    "cdr_value":         real_cdr,
+                    "geometric_cdr":     geo_cdr,
+                    "vlm_cdr":           vlm_cdr,
+                    "decision_basis":    basis,
+                    "analysis":          super_result.get("analysis", ""),
+                    "thinning_detected": super_result.get("thinning_detected", False),
+                    "thinning_location": super_result.get("thinning_location", "None"),
+                },
+            },
+
+            "cdr": {
+                "vertical_cdr":     real_cdr,
+                "clinical_label":   final_pred,
+                "overlay_url_full": None,
+                "overlay_url_crop": None,
+                "raw":              super_result,
+            },
+
+            "final": {
+                "prediction": final_pred,
+                "ads_id":     final_ads,
+                "confidence": round(real_cdr, 4),
+            },
+
+            "fuse": {
+                "applied": True,
+                "reason":  f"port_8025: {basis} (real_cdr={real_cdr:.3f})",
+                "rules":   {"source": "SegFormer+LLaVA", "port": 8025},
+            },
+        }
+
+    # ── Fallback: port 8012 (ResNet50 model probability only) ─────────────────
+    logging.warning("[glaucoma] Using port 8012 fallback — no CDR available")
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(40.0)) as client:
-        # model (8012)
-        model_files = {"file": (image_file.filename, data, getattr(image_file, "content_type", None) or "image/jpeg")}
-        model_resp = await client.post(f"{MODEL_API}?referral_id={referral_id}", files=model_files)
-        model_resp.raise_for_status()
+        model_resp = await client.post(
+            f"{MODEL_API}?referral_id={referral_id}",
+            files={"file": (
+                image_file.filename,
+                data,
+                getattr(image_file, "content_type", None) or "image/jpeg"
+            )}
+        )
+        try:
+            model_resp.raise_for_status()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model API (8012) error: {exc}; raw={model_resp.text[:300]}"
+            )
         m = model_resp.json()
 
-        # cdr (8019) — pass per-eye bias + G folder + original DB filename
-        cdr_files = {"file": (image_file.filename, data, getattr(image_file, "content_type", None) or "image/jpeg")}
-        cdr_form  = {
-            "bias": eye,                       # left / right / auto
-            "g_folder": g_root or "",          # forces saving into \\...\G (and any siblings like \6)
-            "db_image_name": save_name or "",  # ensures overlay filenames match original
-            "g_folder_f":g_root,
-        }
-        cdr_url = f"{CDR_API}?bias={eye}&referral_id={referral_id}&db_image_name_q={image_file.filename}&g_folder_q={g_root}"
-        cdr_resp = await client.post(cdr_url, files=cdr_files, data=cdr_form, timeout=140.0)
-        cdr_resp.raise_for_status()
-        c = cdr_resp.json()
+    g_prob     = float(m.get("glaucoma_probability", 0.0))
+    n_prob     = float(m.get("normal_probability",   0.0))
+    # Derive from probabilities — never trust the ads_id field from downstream
+    model_ads  = 17 if g_prob > n_prob else 16
+    final_pred = "Glaucoma" if model_ads == 17 else "Normal"
+    model_conf = max(g_prob, n_prob)
 
-    # ---------- fuse logic ----------
-    model_ads   = int(m.get("ads_id", 16))
-    g_prob      = float(m.get("glaucoma_probability", 0.0))
-    n_prob      = float(m.get("normal_probability",   0.0))
-    model_conf  = max(g_prob, n_prob)
-    model_pred  = "Glaucoma" if (model_ads == 17 or g_prob > n_prob) else "Normal"
-    FUSE_CONF_MAX       = 0.60
-    FUSE_CDR_MIN_UP     = 0.75
-    DOWNGRADE_CONF_MAX  = 0.55
-    DOWNGRADE_CDR_MAX   = 0.35
+    # Optional CDR from port 8019 for upgrade safeguard
+    # (only used if 8025 was unavailable)
+    v_cdr = None
+    try:
+        g_root   = g_folder or ""
+        save_name = db_image_name or (image_file.filename or "image.jpg")
+        cdr_url  = (
+            f"{CDR_API}?referral_id={referral_id}"
+            f"&db_image_name_q={image_file.filename}"
+            f"&g_folder_q={g_root}"
+        )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            cdr_resp = await client.post(
+                cdr_url,
+                files={"file": (image_file.filename, data,
+                                getattr(image_file, "content_type", None) or "image/jpeg")},
+                data={"bias": eye, "g_folder": g_root, "db_image_name": save_name},
+            )
+            if cdr_resp.status_code == 200:
+                c = cdr_resp.json()
+                # FIX: port 8019 returns cdr_value, not vertical_cdr
+                raw_cdr = c.get("vertical_cdr") or c.get("cdr_value")
+                if raw_cdr is not None:
+                    candidate = float(raw_cdr)
+                    # FIX: sanity clamp — reject implausible values
+                    if 0.0 < candidate <= 1.0:
+                        v_cdr = candidate
+                    else:
+                        logging.warning(
+                            f"[glaucoma fallback] CDR {candidate:.3f} out of range — rejected"
+                        )
+    except Exception as e:
+        logging.warning(f"[glaucoma fallback] CDR service unavailable: {e}")
 
-    v_cdr = c.get("vertical_cdr")
-    v_cdr = float(v_cdr) if isinstance(v_cdr, (int, float)) else None
+    # FIX: FUSE_CDR_THRESH lowered from 0.75 → 0.55
+    FUSE_CDR_THRESH = 0.55
+    FUSE_CONF_MAX   = 0.60
 
-    final_ads    = model_ads
-    final_pred   = model_pred
     fuse_applied = False
     fuse_reason  = None
-
-    if model_ads == 16 and model_conf < FUSE_CONF_MAX and (v_cdr is not None) and (v_cdr >= FUSE_CDR_THRESH):
-        final_ads    = 17
-        final_pred   = "Glaucoma"
+    if (model_ads == 16 and model_conf < FUSE_CONF_MAX
+            and v_cdr is not None and v_cdr >= FUSE_CDR_THRESH):
+        model_ads  = 17
+        final_pred = "Glaucoma"
         fuse_applied = True
-        fuse_reason  = f"Upgraded by CDR safeguard (CDR={v_cdr:.2f} ≥ {FUSE_CDR_THRESH}, model_conf={model_conf:.2f} < {FUSE_CONF_MAX})."
+        fuse_reason  = (
+            f"CDR upgrade: vCDR={v_cdr:.2f} ≥ {FUSE_CDR_THRESH}, "
+            f"model_conf={model_conf:.2f} < {FUSE_CONF_MAX}"
+        )
+        logging.info(f"[glaucoma fallback] Fuse applied: {fuse_reason}")
 
-    # ---------- merged payload ----------
-    merged = {
-        "eye": eye,
-        "filename": image_file.filename,
-        "referral_id": referral_id,
+    return {
+        "eye":          eye,
+        "filename":     image_file.filename,
+        "referral_id":  referral_id,
+        "source":       "port_8012_fallback",
+
         "model": {
             "glaucoma_probability": g_prob,
-            "normal_probability": n_prob,
-            "prediction": model_pred,
-            "ads_id": model_ads,
-            "overlay_url": m.get("overlay_url"),
-            "cdr_analysis": m.get("cdr_analysis"),
+            "normal_probability":   n_prob,
+            "prediction":           final_pred,
+            "ads_id":               model_ads,
+            "overlay_url":          m.get("overlay_url"),
+            "cdr_analysis":         m.get("cdr_analysis"),
         },
+
         "cdr": {
-            "vertical_cdr": v_cdr,
-            "clinical_label": c.get("clinical_label"),
-            "overlay_url_full": c.get("overlay_url_full"),
-            "overlay_url_crop": c.get("overlay_url_crop"),
-            "raw": c,
+            "vertical_cdr":     v_cdr,
+            "clinical_label":   None,
+            "overlay_url_full": None,
+            "overlay_url_crop": None,
+            "raw":              {},
         },
+
         "final": {
             "prediction": final_pred,
-            "ads_id": final_ads,
+            "ads_id":     model_ads,
             "confidence": round(model_conf, 4),
         },
+
         "fuse": {
             "applied": fuse_applied,
-            "reason": fuse_reason,
+            "reason":  fuse_reason,
             "rules": {
                 "if_model_normal_and_conf_lt": FUSE_CONF_MAX,
-                "and_cdr_ge": FUSE_CDR_THRESH,
-                "then_ads_id": 17
-            }
-        }
+                "and_cdr_ge":                 FUSE_CDR_THRESH,
+                "then_ads_id":                17,
+            },
+        },
     }
-    return merged
 
 
 def _full_path(loc: Optional[str], name: Optional[str]) -> str:
