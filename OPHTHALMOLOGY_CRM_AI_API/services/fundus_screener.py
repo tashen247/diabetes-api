@@ -21,6 +21,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
+from rag_context import build_screen_prompt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 log = logging.getLogger("fundus_screener")
@@ -323,15 +324,48 @@ def _resolve_grade(condition: str, raw_grade: str) -> Tuple[str, int]:
     return neg, NEG_ADS[condition]
 
 
-def screen_image(pil_img: Image.Image) -> Dict[str, Any]:
+def _as_int(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def case_map(existing: Optional[Dict], other: Optional[Dict], eye: Optional[str]) -> Dict[str, Dict]:
+    """Per-condition facts the retriever can quote: this eye's classifier ads id and the other eye."""
+    existing = existing or {}
+    other = other or {}
+    cases = {}
+    for condition in PROMPTS:
+        cases[condition] = {
+            "existing_ads": _as_int(existing.get(condition)),
+            "other_eye_ads": _as_int(other.get(condition)),
+            "eye": eye,
+        }
+    return cases
+
+
+def screen_image(pil_img: Image.Image, cases: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
     """
     Run all 6 focused prompts against one image.
+    Each prompt is the focused instruction plus passages retrieved for that condition.
     Returns per-condition results dict.
     """
+    cases = cases or {}
     results = {}
 
     for condition, prompt in PROMPTS.items():
-        raw    = _run_vlm_single(pil_img, prompt)
+        case = cases.get(condition) or {}
+        built = build_screen_prompt(
+            condition,
+            prompt,
+            existing_ads=case.get("existing_ads"),
+            other_eye_ads=case.get("other_eye_ads"),
+            eye=case.get("eye"),
+        )
+        raw    = _run_vlm_single(pil_img, built["prompt"])
         parsed = _parse_single(raw, condition)
         log.info(f"[{condition}] raw: {raw[:120]}")
 
@@ -343,6 +377,7 @@ def screen_image(pil_img: Image.Image) -> Dict[str, Any]:
                 "findings":   "Parse failed",
                 "raw":        raw[:200],
                 "parse_failed": True,
+                "retrieved":  built["retrieved"],
             }
             continue
 
@@ -356,6 +391,7 @@ def screen_image(pil_img: Image.Image) -> Dict[str, Any]:
             "confidence": round(confidence, 3),
             "findings":   findings,
             "raw":        raw[:300],
+            "retrieved":  built["retrieved"],
         }
 
     # Flag uniform confidence as unreliable
@@ -469,10 +505,14 @@ async def screen(
     referral_id:      str        = Form("0"),
     # Optional existing ads_ids per condition: {"diabetes": 2, "hypertension": 7, ...}
     existing_ads_ids: str        = Form("{}"),
+    # Optional fellow-eye classifier ads ids, same shape as existing_ads_ids.
+    other_eye_ads_ids: str       = Form("{}"),
 ):
     """
     Screen a single eye for all 6 conditions using focused per-condition prompts.
     Pass existing_ads_ids (JSON dict) to enable positive-only override logic.
+    Pass other_eye_ads_ids when the fellow eye already has classifier ads ids.
+    Retrieved passages are returned with each condition and inserted into the LLaVA prompt.
     """
     if _vlm_model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -484,9 +524,13 @@ async def screen(
         existing = json.loads(existing_ads_ids) if existing_ads_ids else {}
     except Exception:
         existing = {}
+    try:
+        other_eye = json.loads(other_eye_ads_ids) if other_eye_ads_ids else {}
+    except Exception:
+        other_eye = {}
 
     log.info(f"[screen] referral={referral_id} file={file.filename}")
-    llava_results = screen_image(pil_img)
+    llava_results = screen_image(pil_img, case_map(existing, other_eye, None))
 
     conditions = {}
     flags      = {}
@@ -501,6 +545,7 @@ async def screen(
             "override":        override["overridden"],
             "override_reason": override["reason"],
             "final":           {"ads_id": override["final_ads_id"], "prediction": override["final_grade"]},
+            "retrieved":       llava.get("retrieved", []),
         }
 
         if override["final_ads_id"] != NEG_ADS[condition]:
@@ -538,8 +583,12 @@ async def screen_pair(
     def _screen_one(upload_data: bytes, filename: str, eye: str) -> Dict:
         pil_img = Image.open(io.BytesIO(upload_data)).convert("RGB")
         log.info(f"[screen-pair] {eye} eye: referral={referral_id} file={filename}")
-        llava_results = screen_image(pil_img)
-        existing_eye  = existing.get(eye, {})
+        existing_eye = existing.get(eye, {})
+        other_eye = "right" if eye == "left" else "left"
+        llava_results = screen_image(
+            pil_img,
+            case_map(existing_eye, existing.get(other_eye, {}), eye),
+        )
         out = {}
         for condition, llava in llava_results.items():
             existing_ads = existing_eye.get(condition)
@@ -550,6 +599,7 @@ async def screen_pair(
                 "override":        override["overridden"],
                 "override_reason": override["reason"],
                 "final":           {"ads_id": override["final_ads_id"], "prediction": override["final_grade"]},
+                "retrieved":       llava.get("retrieved", []),
             }
         return out
 
