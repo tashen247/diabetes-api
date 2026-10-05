@@ -5,7 +5,8 @@ import numpy as np
 import cv2
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from rag_context import build_glaucoma_prompt
 from transformers import (
     AutoImageProcessor, SegformerForSemanticSegmentation,
     AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
@@ -54,6 +55,7 @@ class SuperAnalysisReport(BaseModel):
     thinning_detected: bool
     thinning_location: Optional[str] = "None"
     analysis:         str
+    retrieved:        list = Field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,7 +224,12 @@ async def startup():
 
 
 @app.post("/super-analyze", response_model=SuperAnalysisReport)
-async def super_analyze(file: UploadFile = File(...), referral_id: str = Form("0")):
+async def super_analyze(
+    file: UploadFile = File(...),
+    referral_id: str = Form("0"),
+    existing_ads_id: Optional[str] = Form(None),
+    other_eye_ads_id: Optional[str] = Form(None),
+):
     data    = await file.read()
     pil_img = Image.open(io.BytesIO(data)).convert("RGB")
     pil_img.save(f"incoming_image_{referral_id}.jpg")
@@ -233,17 +240,26 @@ async def super_analyze(file: UploadFile = File(...), referral_id: str = Form("0
     log.info(f"[geo] CDR={geo_cdr}")
 
     # ── 2. VLM Reasoning (LLaVA) ─────────────────────────────────────────────
-    prompt = (
+    # Geometric CDR is already measured. Retrieval puts that value, the ads ids,
+    # and any fellow-eye grade into the prompt before LLaVA writes the note.
+    base_prompt = (
         "[INST] <image>\n"
         "You are an ophthalmologist reviewing a fundus photograph. "
         "Please do the following:\n"
-        "1. Estimate the vertical cup-to-disc ratio (CDR) as a decimal between 0.1 and 1.0. "
+        "1. Describe the vertical cup-to-disc ratio using the retrieved geometric measurement when it is present. "
         "State it clearly, e.g. 'The estimated CDR is 0.7'.\n"
         "2. State whether there is rim thinning and in which quadrant "
         "(Superior, Inferior, Nasal, Temporal). "
         "e.g. 'Rim thinning is present in the inferior quadrant.' or 'No rim thinning detected.'\n"
         "Be concise. [/INST]"
     )
+    built = build_glaucoma_prompt(
+        base_prompt,
+        geometric_cdr=geo_cdr,
+        existing_ads=existing_ads_id,
+        other_eye_ads=other_eye_ads_id,
+    )
+    prompt = built["prompt"]
 
     inputs = _vlm_proc(text=prompt, images=pil_img, return_tensors="pt").to(DEVICE)
     log.info(f"[vlm] pixel_values shape={inputs['pixel_values'].shape}, "
@@ -320,6 +336,7 @@ async def super_analyze(file: UploadFile = File(...), referral_id: str = Form("0
         thinning_detected = thinning_detected,
         thinning_location = thinning_loc if thinning_detected else "None",
         analysis          = vlm_res.strip(),
+        retrieved         = built["retrieved"],
     )
 
 
