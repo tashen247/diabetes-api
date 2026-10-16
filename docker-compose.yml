@@ -1,0 +1,22 @@
+# RabbitMQ for the fundus screening fan-out.
+# Intake publishes once. Each model queue, the retry queues, and the dead-letter
+# queue keep their messages until a worker acknowledges them.
+#
+# Host ports stay off 5672/15672. Those belong to the separate ot-rabbitmq
+# broker used by another assessment. Inside the container the ports are still
+# the RabbitMQ defaults; only the published host ports change.
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: diabetes-api-rabbitmq
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

@@ -3282,8 +3282,12 @@ async def predict_all(
         right_eye_file: UploadFile = File(...),
 ):
     """
-    Orchestrates ALL 8 diagnoses. Sends both eyes to each microservice in parallel.
-    Returns a combined JSON payload. Each microservice still writes to DB (as in your logs).
+    Synchronous fan-out to all 8 model endpoints.
+
+    This returns as soon as the HTTP calls finish. A failed model is reported in
+    the body and is not retried. The resilient path is POST /intake/studies:
+    a model being down delays its result, the result is not dropped, and the
+    report stays PENDING until all 8 are in.
     """
     # Read both uploads once
     left_bytes = await left_eye_file.read()
@@ -3317,3 +3321,20 @@ async def predict_all(
 @app.get("/")
 async def root():
     return {"message": "Fundus Image Diagnosis API is running!"}
+
+
+try:
+    from pipeline.api import router as screening_router
+    from pipeline.runtime import on_startup as screening_startup
+
+    app.include_router(screening_router)
+
+    def _start_screening() -> None:
+        try:
+            screening_startup(app)
+        except Exception:
+            logging.exception("Fundus screening pipeline failed to start; stored studies stay pending")
+
+    app.add_event_handler("startup", _start_screening)
+except Exception:
+    logging.exception("Fundus screening pipeline was not mounted")
