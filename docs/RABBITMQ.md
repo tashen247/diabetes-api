@@ -15,6 +15,8 @@ an incomplete `FINAL`. A failure becomes a late report instead of a wrong one.
 
 ## How it works
 
+![Fundus screening architecture](fundus-screening-architecture.png)
+
 ```mermaid
 flowchart LR
     CRM[Ophthalmology CRM] -->|left + right images| IN[Intake API<br/>POST /studies]
