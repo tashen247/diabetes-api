@@ -3275,7 +3275,7 @@ def _post_two_files(name: str, url: str, referral_id: str,
         return name, False, {"error": str(e)}
 
 
-@app.post("/predict-all")
+@app.post("/predict-all", deprecated=True)
 async def predict_all(
         referral_id: str,
         left_eye_file: UploadFile = File(...),
@@ -3284,6 +3284,10 @@ async def predict_all(
     """
     Orchestrates ALL 8 diagnoses. Sends both eyes to each microservice in parallel.
     Returns a combined JSON payload. Each microservice still writes to DB (as in your logs).
+
+    Deprecated: if any model is down, this returns an incomplete set of results. Use
+    POST /studies instead, which queues one test per model through RabbitMQ and keeps the
+    report PENDING until all eight results are in (see docs/RABBITMQ.md).
     """
     # Read both uploads once
     left_bytes = await left_eye_file.read()
@@ -3317,3 +3321,9 @@ async def predict_all(
 @app.get("/")
 async def root():
     return {"message": "Fundus Image Diagnosis API is running!"}
+
+
+# Queued screening through RabbitMQ: POST /studies and GET /studies/{study_id}.
+from messaging.intake import router as studies_router  # noqa: E402
+
+app.include_router(studies_router)

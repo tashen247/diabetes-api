@@ -1,0 +1,30 @@
+name: RabbitMQ pipeline tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-messaging.txt
+      - name: Unit and integration tests
+        working-directory: OPHTHALMOLOGY_CRM_AI_API
+        env:
+          RABBITMQ_URL: amqp://guest:guest@localhost:5672/%2F
+        run: python -m pytest messaging/tests -v
